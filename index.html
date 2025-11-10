@@ -466,6 +466,7 @@
         let currentUserId = null;
         let checkInterval = null;
 
+        // In your HTML file, update the claimRDP function error handling:
         async function claimRDP() {
             const statusDiv = document.getElementById('deploy-status');
             const logDiv = document.getElementById('deploy-log');
@@ -482,12 +483,18 @@
             statusBadge.textContent = 'SEARCHING';
             statusBadge.classList.add('pulse');
             statusText.textContent = 'Searching for available RDP instances...';
-
+        
             try {
-                // Try to claim an RDP immediately
                 const response = await fetch(`${POOL_API_URL}?action=claim`);
+                
+                // Check if response is JSON
+                const contentType = response.headers.get('content-type');
+                if (!contentType || !contentType.includes('application/json')) {
+                    throw new Error('Server returned non-JSON response');
+                }
+                
                 const data = await response.json();
-
+        
                 if (data.success) {
                     // Successfully claimed an RDP
                     currentUserId = data.rdp.user_id;
@@ -497,24 +504,25 @@
                     statusBadge.classList.remove('pulse');
                     statusText.textContent = 'RDP instance claimed successfully!';
                     
-                    logDiv.innerHTML += `✅ Claimed RDP instance!\n`;
+                    logDiv.innerHTML += `✅ ${data.message}\n`;
                     logDiv.innerHTML += `📍 IP: ${data.rdp.ip}\n`;
                     logDiv.innerHTML += `👤 Username: ${data.rdp.username}\n`;
                     logDiv.innerHTML += `🔑 Password: ${data.rdp.password}\n`;
-                    logDiv.innerHTML += `⏰ Session active for 6 hours\n`;
+                    logDiv.innerHTML += `⏰ Session active until: ${data.rdp.expires_at}\n`;
                     
                     button.innerHTML = '<span class="material-icons" style="vertical-align: middle;">check</span> Claimed!';
                     
-                } else if (data.error === 'No RDPs available') {
-                    // No RDPs available, start waiting
-                    logDiv.innerHTML += `⏳ No RDPs available in pool. Waiting for new instances...\n`;
-                    statusText.textContent = 'Waiting for RDP instances to become available...';
+                } else {
+                    // No RDPs available
+                    logDiv.innerHTML += `⏳ ${data.message}\n`;
+                    statusText.textContent = data.message;
                     
                     // Start polling for available RDPs
                     startWaitingForRDP(logDiv, button, statusBadge, statusText);
                 }
             } catch (error) {
                 logDiv.innerHTML += `❌ Error: ${error.message}\n`;
+                logDiv.innerHTML += `🔧 Please check if the PHP backend is running correctly.\n`;
                 button.disabled = false;
                 button.innerHTML = '<span class="material-icons" style="vertical-align: middle;">rocket_launch</span> Claim RDP Now';
                 statusBadge.className = 'status-badge status-available';
