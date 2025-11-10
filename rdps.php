@@ -8,10 +8,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
 }
 
-// Config
+// Config - make sure these files are writable
 $AVAILABLE_FILE = 'available_rdp.txt';
 $IN_USE_FILE = 'in_use_rdp.txt';
 $LOG_FILE = 'rdp_pool_log.txt';
+
+// Initialize files if they don't exist
+if (!file_exists($AVAILABLE_FILE)) {
+    file_put_contents($AVAILABLE_FILE, '');
+}
+if (!file_exists($IN_USE_FILE)) {
+    file_put_contents($IN_USE_FILE, '');
+}
+if (!file_exists($LOG_FILE)) {
+    file_put_contents($LOG_FILE, '');
+}
 
 function logEvent($message) {
     global $LOG_FILE;
@@ -22,6 +33,9 @@ function logEvent($message) {
 function getAvailableRDPs() {
     global $AVAILABLE_FILE;
     if (!file_exists($AVAILABLE_FILE)) return [];
+    
+    $content = file_get_contents($AVAILABLE_FILE);
+    if (empty(trim($content))) return [];
     
     $lines = file($AVAILABLE_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
     $available = [];
@@ -43,6 +57,9 @@ function getAvailableRDPs() {
 function getInUseRDPs() {
     global $IN_USE_FILE;
     if (!file_exists($IN_USE_FILE)) return [];
+    
+    $content = file_get_contents($IN_USE_FILE);
+    if (empty(trim($content))) return [];
     
     $lines = file($IN_USE_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
     $in_use = [];
@@ -73,7 +90,8 @@ function saveAvailableRDPs($rdpList) {
             $rdp['added_at'] ?? date('Y-m-d H:i:s')
         ]);
     }
-    file_put_contents($AVAILABLE_FILE, implode("\n", $lines) . "\n", LOCK_EX);
+    $result = file_put_contents($AVAILABLE_FILE, implode("\n", $lines) . "\n", LOCK_EX);
+    return $result !== false;
 }
 
 function saveInUseRDPs($rdpList) {
@@ -88,7 +106,8 @@ function saveInUseRDPs($rdpList) {
             $rdp['claimed_at'] ?? date('Y-m-d H:i:s')
         ]);
     }
-    file_put_contents($IN_USE_FILE, implode("\n", $lines) . "\n", LOCK_EX);
+    $result = file_put_contents($IN_USE_FILE, implode("\n", $lines) . "\n", LOCK_EX);
+    return $result !== false;
 }
 
 function generateUserID() {
@@ -121,14 +140,23 @@ function cleanupExpiredRDPs() {
     if ($expired_found) {
         saveInUseRDPs(array_values($in_use));
         saveAvailableRDPs($available);
+        return true;
     }
+    return false;
 }
 
-// Handle POST - Add new RDP to available pool (from GitHub workflow)
+function sendJSONResponse($data, $statusCode = 200) {
+    http_response_code($statusCode);
+    echo json_encode($data, JSON_PRETTY_PRINT);
+    exit;
+}
+
+// Handle POST - Add new RDP to available pool
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $input = json_decode(file_get_contents('php://input'), true);
     
-    if (!$input) {
+    // Also try form data if JSON fails
+    if (!$input || json_last_error() !== JSON_ERROR_NONE) {
         $input = $_POST;
     }
     
@@ -137,9 +165,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $password = trim($input['password'] ?? '');
     
     if (empty($ip) || empty($username) || empty($password)) {
-        http_response_code(400);
-        echo json_encode(['error' => 'Missing IP, username, or password']);
-        exit;
+        sendJSONResponse([
+            'success' => false,
+            'error' => 'Missing IP, username, or password',
+            'received' => ['ip' => $ip, 'username' => $username, 'password' => !empty($password) ? '***' : '']
+        ], 400);
     }
     
     // Cleanup expired RDPs first
@@ -151,28 +181,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Check if this IP already exists in pool
     foreach ($available as $existing) {
         if ($existing['ip'] === $ip) {
-            http_response_code(409);
-            echo json_encode(['error' => 'RDP with this IP already exists in pool']);
-            exit;
+            sendJSONResponse([
+                'success' => false,
+                'error' => 'RDP with this IP already exists in pool',
+                'existing_ip' => $ip
+            ], 409);
         }
     }
     
-    $available[] = [
+    $newRDP = [
         'ip' => $ip,
         'username' => $username,
         'password' => $password,
         'added_at' => date('Y-m-d H:i:s')
     ];
     
-    saveAvailableRDPs($available);
+    $available[] = $newRDP;
     
-    logEvent("RDP ADDED: $ip - $username");
-    echo json_encode([
-        'success' => true, 
-        'message' => 'RDP added to pool',
-        'total_available' => count($available)
-    ]);
-    exit;
+    if (saveAvailableRDPs($available)) {
+        logEvent("RDP ADDED: $ip - $username");
+        sendJSONResponse([
+            'success' => true, 
+            'message' => 'RDP added to pool',
+            'rdp' => $newRDP,
+            'total_available' => count($available)
+        ]);
+    } else {
+        sendJSONResponse([
+            'success' => false,
+            'error' => 'Failed to save RDP to pool'
+        ], 500);
+    }
 }
 
 // Handle GET - Claim an RDP
@@ -183,13 +222,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'claim')
     $available = getAvailableRDPs();
     
     if (empty($available)) {
-        http_response_code(404);
-        echo json_encode([
+        sendJSONResponse([
+            'success' => false,
             'error' => 'No RDPs available', 
             'available_count' => 0,
             'message' => 'All RDP instances are currently in use. Please try again later.'
-        ]);
-        exit;
+        ], 404);
     }
     
     // Get first available RDP
@@ -202,36 +240,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'claim')
     $rdp['claimed_at'] = date('Y-m-d H:i:s');
     $in_use[] = $rdp;
     
-    saveAvailableRDPs($available);
-    saveInUseRDPs($in_use);
-    
-    logEvent("RDP CLAIMED: {$rdp['ip']} by $user_id");
-    
-    echo json_encode([
-        'success' => true,
-        'rdp' => [
-            'ip' => $rdp['ip'],
-            'username' => $rdp['username'],
-            'password' => $rdp['password'],
-            'user_id' => $user_id,
-            'claimed_at' => $rdp['claimed_at'],
-            'expires_at' => date('Y-m-d H:i:s', strtotime('+6 hours'))
-        ],
-        'remaining' => count($available),
-        'message' => 'RDP instance claimed successfully!'
-    ]);
-    exit;
+    if (saveAvailableRDPs($available) && saveInUseRDPs($in_use)) {
+        logEvent("RDP CLAIMED: {$rdp['ip']} by $user_id");
+        
+        sendJSONResponse([
+            'success' => true,
+            'rdp' => [
+                'ip' => $rdp['ip'],
+                'username' => $rdp['username'],
+                'password' => $rdp['password'],
+                'user_id' => $user_id,
+                'claimed_at' => $rdp['claimed_at'],
+                'expires_at' => date('Y-m-d H:i:s', strtotime('+6 hours'))
+            ],
+            'remaining' => count($available),
+            'message' => 'RDP instance claimed successfully!'
+        ]);
+    } else {
+        sendJSONResponse([
+            'success' => false,
+            'error' => 'Failed to claim RDP'
+        ], 500);
+    }
 }
 
-// Handle DELETE - Release an RDP
-if ($_SERVER['REQUEST_METHOD'] === 'DELETE' || ($_GET['action'] ?? '') === 'release') {
-    $input = json_decode(file_get_contents('php://input'), true) ?? $_GET;
-    $user_id = $input['user_id'] ?? '';
+// Handle GET - Release an RDP
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'release') {
+    $user_id = $_GET['user_id'] ?? '';
     
     if (empty($user_id)) {
-        http_response_code(400);
-        echo json_encode(['error' => 'Missing user_id']);
-        exit;
+        sendJSONResponse([
+            'success' => false,
+            'error' => 'Missing user_id parameter'
+        ], 400);
     }
     
     $in_use = getInUseRDPs();
@@ -256,25 +297,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'DELETE' || ($_GET['action'] ?? '') === 'rele
     }
     
     if ($released_rdp) {
-        saveInUseRDPs(array_values($in_use));
-        saveAvailableRDPs($available);
-        
-        logEvent("RDP RELEASED: {$released_rdp['ip']} by $user_id");
-        
-        echo json_encode([
-            'success' => true,
-            'message' => 'RDP released back to pool',
-            'released_rdp' => [
-                'ip' => $released_rdp['ip'],
-                'username' => $released_rdp['username']
-            ],
-            'available_count' => count($available)
-        ]);
+        if (saveInUseRDPs(array_values($in_use)) && saveAvailableRDPs($available)) {
+            logEvent("RDP RELEASED: {$released_rdp['ip']} by $user_id");
+            
+            sendJSONResponse([
+                'success' => true,
+                'message' => 'RDP released back to pool',
+                'released_rdp' => [
+                    'ip' => $released_rdp['ip'],
+                    'username' => $released_rdp['username']
+                ],
+                'available_count' => count($available)
+            ]);
+        } else {
+            sendJSONResponse([
+                'success' => false,
+                'error' => 'Failed to save pool data'
+            ], 500);
+        }
     } else {
-        http_response_code(404);
-        echo json_encode(['error' => 'RDP not found or already released']);
+        sendJSONResponse([
+            'success' => false,
+            'error' => 'RDP not found or already released'
+        ], 404);
     }
-    exit;
 }
 
 // Handle GET - Get pool status
@@ -284,79 +330,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'status'
     $available = getAvailableRDPs();
     $in_use = getInUseRDPs();
     
-    echo json_encode([
+    sendJSONResponse([
         'success' => true,
         'pool_status' => [
             'available_count' => count($available),
             'in_use_count' => count($in_use),
             'total_count' => count($available) + count($in_use),
             'available_ips' => array_column($available, 'ip'),
-            'in_use_ips' => array_column($in_use, 'ip')
-        ]
-    ]);
-    exit;
-}
-
-// Handle GET - Get all data (admin view)
-if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'admin') {
-    $available = getAvailableRDPs();
-    $in_use = getInUseRDPs();
-    
-    echo json_encode([
-        'success' => true,
-        'available' => $available,
-        'in_use' => $in_use,
-        'stats' => [
-            'total_available' => count($available),
-            'total_in_use' => count($in_use),
+            'in_use_ips' => array_column($in_use, 'ip'),
             'timestamp' => date('Y-m-d H:i:s')
         ]
     ]);
-    exit;
 }
 
-// Handle POST - Add multiple RDPs (for testing)
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'add-multiple') {
-    $input = json_decode(file_get_contents('php://input'), true);
-    $rdps = $input['rdps'] ?? [];
-    $added = 0;
-    
-    $available = getAvailableRDPs();
-    
-    foreach ($rdps as $rdp) {
-        if (!empty($rdp['ip']) && !empty($rdp['username']) && !empty($rdp['password'])) {
-            $available[] = [
-                'ip' => $rdp['ip'],
-                'username' => $rdp['username'],
-                'password' => $rdp['password'],
-                'added_at' => date('Y-m-d H:i:s')
-            ];
-            $added++;
-        }
-    }
-    
-    saveAvailableRDPs($available);
-    
-    echo json_encode([
+// Handle GET - Test endpoint
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'test') {
+    sendJSONResponse([
         'success' => true,
-        'message' => "Added $added RDPs to pool",
-        'total_available' => count($available)
+        'message' => 'RDP Pool API is working!',
+        'timestamp' => date('Y-m-d H:i:s'),
+        'endpoints' => [
+            'POST /' => 'Add RDP to pool',
+            'GET ?action=claim' => 'Claim an RDP',
+            'GET ?action=release&user_id=XXX' => 'Release an RDP',
+            'GET ?action=status' => 'Get pool status',
+            'GET ?action=test' => 'Test endpoint'
+        ]
     ]);
-    exit;
 }
 
-// Default response - API info
-echo json_encode([
-    'api' => 'Alpine Cloud RDP Pool System',
-    'version' => '1.0',
-    'endpoints' => [
+// Default response for unknown requests
+sendJSONResponse([
+    'success' => false,
+    'error' => 'Invalid endpoint',
+    'available_actions' => [
         'POST /' => 'Add RDP to pool',
-        'GET ?action=claim' => 'Claim an RDP',
-        'GET ?action=release&user_id=XXX' => 'Release an RDP',
+        'GET ?action=claim' => 'Claim an RDP', 
+        'GET ?action=release' => 'Release an RDP',
         'GET ?action=status' => 'Get pool status',
-        'GET ?action=admin' => 'Admin view (all data)',
-        'POST ?action=add-multiple' => 'Add multiple RDPs'
-    ],
-    'current_time' => date('Y-m-d H:i:s')
-]);
+        'GET ?action=test' => 'Test endpoint'
+    ]
+], 400);
 ?>
